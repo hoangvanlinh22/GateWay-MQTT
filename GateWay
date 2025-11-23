@@ -1,0 +1,334 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include "ESPAsyncWebServer.h"
+#include "SPIFFS.h"
+
+const char *ssid = "kira";
+const char *password = "12345678";
+const char *mqtt_server = "192.168.239.247";
+const int mqtt_port = 1883;
+const char *mqtt_id = "esp32_host";
+
+// MQTT topics
+const char *node_temp_topic = "esp32_node1/temperature";
+const char *node_humi_topic = "esp32_node1/humidity";
+const char *node_relay_topic = "esp32_node1/relay"; // Topic điều khiển relay trên Node
+const char *node_relay_status_topic = "esp32_node1/relay/status"; // Topic nhận trạng thái relay từ Node
+
+float hostTemperature = 0.0;
+float hostHumidity = 0.0;       
+String nodeTemperature = "--";
+String nodeHumidity = "--";
+
+#define HOST_RELAY1_PIN 4    // Relay 1 trên Host
+#define HOST_RELAY2_PIN 15   // Relay 2 trên Host
+#define NODE_RELAY_PIN 4    // Relay trên Node
+
+#define BUTTON1_PIN 23       // Nút nhấn điều khiển relay Node
+#define BUTTON2_PIN 19       // Nút nhấn điều khiển relay Host (Relay 1)
+#define BUTTON3_PIN 18       // Nút nhấn điều khiển relay Host (Relay 2)
+
+#define DHTPIN 5
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+WiFiClient client;
+PubSubClient mqtt_client(client);
+AsyncWebServer server(80);
+
+bool hostRelay1State = LOW; // Trạng thái của relay 1 trên Host
+bool hostRelay2State = LOW; // Trạng thái của relay 2 trên Host
+bool nodeRelayState = LOW;  // Trạng thái của relay trên Node
+
+bool lastButton1State = HIGH; // Trạng thái trước đó của nút nhấn 1
+bool lastButton2State = HIGH; // Trạng thái trước đó của nút nhấn 2
+bool lastButton3State = HIGH; // Trạng thái trước đó của nút nhấn 3
+
+String nodeRelayStatus = "off"; // Lưu trạng thái của relay Node (mặc định "off")
+
+void mqttCallback(char *topic, byte *payload, unsigned int length) {
+    String message = "";
+    for (int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+
+    if (String(topic) == node_temp_topic) { 
+        nodeTemperature = message;
+    } else if (String(topic) == node_humi_topic) {
+        nodeHumidity = message;
+    } else if (String(topic) == node_relay_status_topic) {
+        nodeRelayStatus = message;
+        nodeRelayState = (message == "on") ? HIGH : LOW; // Đồng bộ trạng thái relay của Node
+        Serial.println("Node relay status updated: " + nodeRelayStatus);
+    }
+
+    Serial.println("Received MQTT message: " + String(topic) + " = " + message);
+}
+
+String readDHTTemperature() {
+    float t = dht.readTemperature();
+    if (isnan(t)) {
+        Serial.println("Failed to read temperature from DHT sensor!");
+        return "--";
+    }
+    hostTemperature = t;
+    return String(t);
+}
+
+String readDHTHumidity() {
+    float h = dht.readHumidity();
+    if (isnan(h)) {
+        Serial.println("Failed to read humidity from DHT sensor!");
+        return "--";
+    }
+    hostHumidity = h;
+    return String(h);   
+}
+
+// Điều khiển relay Host 1
+void toggleHostRelay1() {
+    hostRelay1State = !hostRelay1State;
+    digitalWrite(HOST_RELAY1_PIN, hostRelay1State ? HIGH : LOW);
+    Serial.println("Host relay 1 toggled: " + String(hostRelay1State ? "ON" : "OFF"));
+}
+
+// Điều khiển relay Host 2
+void toggleHostRelay2() {
+    hostRelay2State = !hostRelay2State;
+    digitalWrite(HOST_RELAY2_PIN, hostRelay2State ? HIGH : LOW);
+    Serial.println("Host relay 2 toggled: " + String(hostRelay2State ? "ON" : "OFF"));
+}
+
+// Điều khiển relay Node
+void toggleNodeRelay() {
+    nodeRelayState = !nodeRelayState;
+    mqtt_client.publish(node_relay_topic, nodeRelayState ? "on" : "off"); // Gửi lệnh qua MQTT
+    Serial.println("Node relay toggled: " + String(nodeRelayState ? "ON" : "OFF"));
+}
+
+void setup() {
+    Serial.begin(9600);
+    dht.begin();
+    
+    // Cấu hình relay
+    pinMode(HOST_RELAY1_PIN, OUTPUT);
+    pinMode(HOST_RELAY2_PIN, OUTPUT);
+    digitalWrite(HOST_RELAY1_PIN, LOW); // Mặc định tắt relay 1
+    digitalWrite(HOST_RELAY2_PIN, LOW); // Mặc định tắt relay 2
+
+    // Cấu hình nút nhấn vật lý
+    pinMode(BUTTON1_PIN, INPUT_PULLUP);
+    pinMode(BUTTON2_PIN, INPUT_PULLUP);
+    pinMode(BUTTON3_PIN, INPUT_PULLUP);
+
+    // Kết nối WiFi
+    Serial.print("Connecting to WiFi: ");
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nConnected to WiFi! IP: " + WiFi.localIP().toString());
+
+    // Kết nối MQTT
+    mqtt_client.setServer(mqtt_server, mqtt_port);
+    mqtt_client.setCallback(mqttCallback);
+    while (!mqtt_client.connected()) {
+        Serial.println("Connecting to MQTT...");
+        if (mqtt_client.connect(mqtt_id)) {
+            Serial.println("Connected to MQTT!");
+            mqtt_client.subscribe(node_temp_topic);
+            mqtt_client.subscribe(node_humi_topic);
+            mqtt_client.subscribe(node_relay_status_topic); // Đăng ký topic trạng thái relay của Node
+        } else {
+            Serial.print("Failed MQTT connection, state=");
+            Serial.println(mqtt_client.state());
+            delay(5000);
+        }
+    }
+
+    // Cấu hình Web Server
+    if (!SPIFFS.begin(true)) {
+    Serial.println("Failed to mount SPIFFS");
+    return;
+}
+
+// Phục vụ tệp HTML chính từ SPIFFS
+server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(SPIFFS, "/index.html", "text/html");
+});
+
+// Phục vụ tệp CSS từ SPIFFS
+server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(SPIFFS, "/style.css", "text/css");
+});
+
+// Phục vụ tệp JavaScript từ SPIFFS
+server.on("/script.js", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(SPIFFS, "/script.js", "application/javascript");
+});
+
+// API: Lấy nhiệt độ từ Host
+server.on("/host/temperature", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String temperature = readDHTTemperature();
+    request->send(200, "text/plain", temperature);
+    Serial.println("Host Temperature API called. Value: " + temperature);
+});
+
+// API: Lấy độ ẩm từ Host
+server.on("/host/humidity", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String humidity = readDHTHumidity();
+    request->send(200, "text/plain", humidity);
+    Serial.println("Host Humidity API called. Value: " + humidity);
+});
+
+// API: Điều khiển relay 1 trên Host (Relay trên GPIO 5)
+server.on("/host/relay1", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("state", true)) {
+        String state = request->getParam("state", true)->value();
+        if (state == "on") {
+            digitalWrite(HOST_RELAY1_PIN, HIGH);
+            hostRelay1State = HIGH;
+            request->send(200, "text/plain", "Host relay 1 turned ON");
+        } else if (state == "off") {
+            digitalWrite(HOST_RELAY1_PIN, LOW);
+            hostRelay1State = LOW;
+            request->send(200, "text/plain", "Host relay 1 turned OFF");
+        } else {
+            request->send(400, "text/plain", "Invalid state");
+        }
+    } else {
+        request->send(400, "text/plain", "Missing 'state' parameter");
+    }
+    Serial.println("Host Relay 1 API called. State: " + String(hostRelay1State ? "ON" : "OFF"));
+});
+
+// API: Lấy trạng thái relay 1 trên Host
+server.on("/host/relay1/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String status = digitalRead(HOST_RELAY1_PIN) == HIGH ? "on" : "off";
+    request->send(200, "text/plain", status);
+    Serial.println("Host Relay 1 Status API called. Current Status: " + status);
+});
+
+// API: Điều khiển relay 2 trên Host (Relay trên GPIO 18)
+server.on("/host/relay2", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("state", true)) {
+        String state = request->getParam("state", true)->value();
+        if (state == "on") {
+            digitalWrite(HOST_RELAY2_PIN, HIGH);
+            hostRelay2State = HIGH;
+            request->send(200, "text/plain", "Host relay 2 turned ON");
+        } else if (state == "off") {
+            digitalWrite(HOST_RELAY2_PIN, LOW);
+            hostRelay2State = LOW;
+            request->send(200, "text/plain", "Host relay 2 turned OFF");
+        } else {
+            request->send(400, "text/plain", "Invalid state");
+        }
+    } else {
+        request->send(400, "text/plain", "Missing 'state' parameter");
+    }
+    Serial.println("Host Relay 2 API called. State: " + String(hostRelay2State ? "ON" : "OFF"));
+});
+
+// API: Lấy trạng thái relay 2 trên Host
+server.on("/host/relay2/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String status = digitalRead(HOST_RELAY2_PIN) == HIGH ? "on" : "off";
+    request->send(200, "text/plain", status);
+    Serial.println("Host Relay 2 Status API called. Current Status: " + status);
+});
+
+// API: Lấy nhiệt độ từ Node (qua MQTT)
+server.on("/node/temperature", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", nodeTemperature);
+    Serial.println("Node Temperature API called. Value: " + nodeTemperature);
+});
+
+// API: Lấy độ ẩm từ Node (qua MQTT)
+server.on("/node/humidity", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", nodeHumidity);
+    Serial.println("Node Humidity API called. Value: " + nodeHumidity);
+});
+
+// API: Điều khiển relay trên Node (qua MQTT)
+server.on("/node/relay", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("state", true)) {
+        String state = request->getParam("state", true)->value();
+        if (state == "on" || state == "off") {
+            if (mqtt_client.publish(node_relay_topic, state.c_str())) {
+                request->send(200, "text/plain", "Node relay command sent successfully");
+            } else {
+                request->send(500, "text/plain", "Failed to send Node relay command");
+            }
+        } else {
+            request->send(400, "text/plain", "Invalid state (use 'on' or 'off')");
+        }
+    } else {
+        request->send(400, "text/plain", "Missing 'state' parameter");
+    }
+    Serial.println("Node Relay API called. Command: " + request->getParam("state", true)->value());
+});
+
+// API: Lấy trạng thái relay trên Node (qua MQTT)
+server.on("/node/relay/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", nodeRelayStatus);
+    Serial.println("Node Relay Status API called. Current Status: " + nodeRelayStatus);
+});
+
+// Khởi động Web Server
+server.begin();
+Serial.println("Web server started!");
+}
+
+void reconnectMQTT() {
+    while (!mqtt_client.connected()) {
+        Serial.println("Reconnecting to MQTT...");
+        if (mqtt_client.connect(mqtt_id)) {
+            Serial.println("Reconnected to MQTT!");
+            mqtt_client.subscribe(node_temp_topic);
+            mqtt_client.subscribe(node_humi_topic);
+            mqtt_client.subscribe(node_relay_status_topic); // Đăng ký lại topic relay
+        } else {
+            delay(5000);
+        }
+    }
+}
+
+void loop() {
+    if (!mqtt_client.connected()) {
+        reconnectMQTT();
+    }
+    mqtt_client.loop();
+
+    static unsigned long lastDebounceTime1 = 0;
+    static unsigned long lastDebounceTime2 = 0;
+    static unsigned long lastDebounceTime3 = 0;
+    const unsigned long debounceDelay = 200;
+
+    // Kiểm tra nút nhấn 1 (Relay Node)
+    bool currentButton1State = digitalRead(BUTTON1_PIN);
+    if (currentButton1State == LOW && lastButton1State == HIGH && (millis() - lastDebounceTime1 > debounceDelay)) {
+        lastDebounceTime1 = millis();
+        toggleNodeRelay();
+        mqtt_client.publish(node_relay_topic, nodeRelayState ? "on" : "off"); // Send MQTT command for Node relay
+    }
+    lastButton1State = currentButton1State;
+
+    // Kiểm tra nút nhấn 2 (Relay 1 trên Host)
+    bool currentButton2State = digitalRead(BUTTON2_PIN);
+    if (currentButton2State == LOW && lastButton2State == HIGH && (millis() - lastDebounceTime2 > debounceDelay)) {
+        lastDebounceTime2 = millis();
+        toggleHostRelay1();
+    }
+    lastButton2State = currentButton2State;
+
+    // Kiểm tra nút nhấn 3 (Relay 2 trên Host)
+    bool currentButton3State = digitalRead(BUTTON3_PIN);
+    if (currentButton3State == LOW && lastButton3State == HIGH && (millis() - lastDebounceTime3 > debounceDelay)) {
+        lastDebounceTime3 = millis();
+        toggleHostRelay2();
+    }
+    lastButton3State = currentButton3State;
+}
