@@ -1,0 +1,154 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+
+// WiFi và MQTT thông tin
+const char *ssid = "kira";
+const char *password = "01092003";
+const char *mqtt_server = "192.168.239.247";
+const int mqtt_port = 1883;
+const char *mqtt_id = "esp32_node1";
+
+// MQTT topics
+const char *node_temp_topic = "esp32_node1/temperature";
+const char *node_humi_topic = "esp32_node1/humidity";
+const char *node_relay_topic = "esp32_node1/relay";
+const char *node_relay_status_topic = "esp32_node1/relay/status";
+
+// Cấu hình DHT và relay
+#define DHTPIN 5
+#define DHTTYPE DHT22
+#define RELAY_PIN 4
+#define BUTTON_PIN 23 // Nút nhấn vật lý để điều khiển relay
+DHT dht(DHTPIN, DHTTYPE);
+
+WiFiClient client;
+PubSubClient mqtt_client(client);
+
+bool relayState = LOW; // Trạng thái mặc định của relay
+bool lastButtonState = HIGH; // Trạng thái trước đó của nút nhấn
+unsigned long lastDebounceTime = 0; // Thời gian debounce lần cuối
+const unsigned long debounceDelay = 200; // Độ trễ debounce
+
+// Hàm cập nhật trạng thái relay
+void updateRelayStatus() {
+    String status = relayState ? "on" : "off";
+    mqtt_client.publish(node_relay_status_topic, status.c_str());
+    Serial.println("Relay status updated: " + status);
+}
+
+// Hàm kết nối WiFi
+void setupWiFi() {
+    Serial.print("Connecting to WiFi");
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi connected. IP: " + WiFi.localIP().toString());
+}
+
+// Hàm xử lý callback MQTT
+void mqttCallback(char *topic, byte *payload, unsigned int length) {
+    String message = "";
+    for (int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+
+    if (String(topic) == node_relay_topic) {
+        Serial.println("Received relay command: " + message);
+        if (message == "on") {
+            digitalWrite(RELAY_PIN, HIGH);
+            relayState = HIGH;
+            Serial.println("Relay turned ON");
+            updateRelayStatus();
+        } else if (message == "off") {
+            digitalWrite(RELAY_PIN, LOW);
+            relayState = LOW;
+            Serial.println("Relay turned OFF");
+            updateRelayStatus();
+        } else {
+            Serial.println("Invalid command received: " + message);
+        }
+    }
+}
+
+// Hàm kết nối MQTT
+void setupMQTT() {
+    mqtt_client.setServer(mqtt_server, mqtt_port);
+    mqtt_client.setCallback(mqttCallback);
+    while (!mqtt_client.connected()) {
+        Serial.print("Connecting to MQTT...");
+        if (mqtt_client.connect(mqtt_id)) {
+            Serial.println("Connected to MQTT");
+            mqtt_client.subscribe(node_relay_topic); // Đăng ký nhận lệnh điều khiển relay
+        } else {
+            Serial.print("Failed, state=");
+            Serial.println(mqtt_client.state());
+            delay(2000);
+        }       
+    }
+}
+
+// Hàm gửi dữ liệu DHT đến Host
+void publishSensorData() {
+    float temperature = dht.readTemperature();
+    float humidity = dht.readHumidity();
+
+    if (!isnan(temperature)) {
+        mqtt_client.publish(node_temp_topic, String(temperature).c_str());
+        Serial.println("Temperature published: " + String(temperature));
+    } else {
+        Serial.println("Failed to read temperature");
+    }
+
+    if (!isnan(humidity)) {
+        mqtt_client.publish(node_humi_topic, String(humidity).c_str());
+        Serial.println("Humidity published: " + String(humidity));
+    } else {
+        Serial.println("Failed to read humidity");
+    }
+}
+
+void setup() {
+    Serial.begin(9600);
+    dht.begin();
+
+    // Cấu hình relay và nút nhấn
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, LOW);
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+    // Kết nối WiFi và MQTT
+    setupWiFi();
+    setupMQTT();
+
+    // Gửi trạng thái relay ban đầu
+    updateRelayStatus();
+}
+
+void loop() {
+    if (!mqtt_client.connected()) {
+        setupMQTT(); // Kết nối lại MQTT nếu bị ngắt
+    }
+    mqtt_client.loop();
+
+    // Gửi dữ liệu DHT mỗi 10 giây
+    static unsigned long lastPublishTime = 0;
+    if (millis() - lastPublishTime >= 10000) {
+        publishSensorData();
+        lastPublishTime = millis();
+    }
+
+    // Kiểm tra nút nhấn vật lý
+    bool currentButtonState = digitalRead(BUTTON_PIN);
+    if (currentButtonState == LOW && lastButtonState == HIGH && (millis() - lastDebounceTime > debounceDelay)) {
+        lastDebounceTime = millis();
+        relayState = !relayState; // Đổi trạng thái relay
+        digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
+        Serial.println("Relay toggled via button: " + String(relayState ? "ON" : "OFF"));
+        updateRelayStatus(); // Cập nhật trạng thái relay qua MQTT
+    }
+    lastButtonState = currentButtonState;
+}
